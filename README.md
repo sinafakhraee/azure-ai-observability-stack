@@ -1,6 +1,6 @@
 # Azure OpenAI Observability with AI Gateway
 
-A complete observability reference for Azure OpenAI workloads routed through **Microsoft Foundry** and **Azure API Management AI Gateway**, with telemetry flowing into **Azure Monitor Log Analytics** and **Application Insights**.
+A sample observability reference for Azure OpenAI workloads routed through **Microsoft Foundry** and **Azure API Management AI Gateway**, with telemetry flowing into **Azure Monitor Log Analytics** and **Application Insights**.
 
 This guide also shows how to use **Azure Monitor dashboards with Azure Managed Grafana** to visualize token, cost, and latency trends.
 
