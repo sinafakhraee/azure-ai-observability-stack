@@ -2,6 +2,8 @@
 
 A complete observability reference for Azure OpenAI workloads routed through **Microsoft Foundry** and **Azure API Management AI Gateway**, with telemetry flowing into **Azure Monitor Log Analytics** and **Application Insights**.
 
+This guide also shows how to use **Azure Monitor dashboards with Azure Managed Grafana** to visualize token, cost, and latency trends.
+
 ---
 
 ## Architecture Overview
@@ -101,6 +103,13 @@ A complete observability reference for Azure OpenAI workloads routed through **M
 - Connected `<your-application-insights>` to the APIM instance
 - Captures request telemetry, trace, exceptions, and custom metrics from client-side instrumentation (TTFT/TTLT for streaming)
 
+### 5. Azure Monitor Dashboards with Grafana
+- Added Azure Managed Grafana as a dashboard layer on top of Azure Monitor data
+- Included the Azure AI Foundry dashboard reference and official documentation:
+  - Dashboard reference: <http://aka.ms/amg/dash/ai-foundry>
+  - Documentation: <https://learn.microsoft.com/en-us/azure/managed-grafana/azure-ai-foundry-dashboard>
+- Used Grafana panels to visualize token and latency trends alongside KQL-based investigations
+
 ---
 
 ## Telemetry Reference
@@ -135,6 +144,29 @@ A complete observability reference for Azure OpenAI workloads routed through **M
 | TTFT / TTLT (streaming) | Application Insights (`customMetrics`) |
 | End-to-end tracing | Application Insights (`requests` + `traces`) |
 | Platform capacity metrics | Azure Monitor (`AzureMetrics`) |
+
+---
+
+## Azure Monitor Dashboard with Grafana
+
+In addition to KQL queries, you can use Azure Monitor data directly in **Azure Managed Grafana** dashboards for operational views and executive-friendly reporting.
+
+- Dashboard reference: <http://aka.ms/amg/dash/ai-foundry>
+- Documentation: <https://learn.microsoft.com/en-us/azure/managed-grafana/azure-ai-foundry-dashboard>
+
+### Example Grafana Views
+
+#### 1. Dashboard Overview (Token + Cost)
+![Azure Monitor Grafana Dashboard](monitor-grafana-dash-1.png)
+
+#### 2. Average Latency (Time to Last Byte)
+![Average Latency Time to Last Byte](avg-token.png)
+
+#### 3. Input Tokens
+![Input Tokens](input-token.png)
+
+#### 4. Total Tokens
+![Total Tokens](total-token.png)
 
 ---
 
@@ -233,43 +265,7 @@ gw
 
 ---
 
-### 3. Max Concurrency and Headroom per Deployment
-**What it does:** Computes the peak and P95 concurrency observed per deployment over a time window, then compares against a configured limit to show remaining headroom. Use this to answer: *"How close am I to my concurrency limit?"*
-
-```kusto
-let lookback = 2h;
-let configured_limit = 60; // Set to your actual deployment capacity
-let gw =
-    ApiManagementGatewayLogs
-    | where TimeGenerated > ago(lookback)
-    | where Url has "/openai/v1/responses"
-    | where isnotempty(CorrelationId)
-    | extend EndTime = TimeGenerated
-    | extend StartTime = EndTime - totimespan(TotalTime * 1ms)
-    | project CorrelationId, StartTime, EndTime;
-let llm =
-    ApiManagementGatewayLlmLog
-    | where TimeGenerated > ago(lookback)
-    | where isnotempty(CorrelationId)
-    | summarize DeploymentName = any(DeploymentName) by CorrelationId;
-let active =
-    gw
-    | join kind=leftouter llm on CorrelationId
-    | extend Deployment = coalesce(DeploymentName, "unknown")
-    | extend s = bin(StartTime, 1s), e = bin(EndTime, 1s)
-    | mv-expand ts = range(s, e, 1s) to typeof(datetime)
-    | summarize ActiveConcurrentRequests = count() by Deployment, ts;
-active
-| summarize MaxConcurrency = max(ActiveConcurrentRequests), P95Concurrency = percentile(ActiveConcurrentRequests, 95) by Deployment
-| extend ConfiguredLimit = configured_limit
-| extend Headroom = ConfiguredLimit - MaxConcurrency
-| extend HeadroomPct = round(100.0 * Headroom / ConfiguredLimit, 2)
-| order by MaxConcurrency desc
-```
-
----
-
-### 4. Error, Timeout, and Throttling Rates — 30-Second Intervals (Local Time)
+### 3. Error, Timeout, and Throttling Rates — 30-Second Intervals (Local Time)
 **What it does:** Aggregates all gateway requests into 30-second buckets, classifying each request as success, throttled (429), timeout (408/504 or timeout error reason), or other error. Use this to answer: *"What percentage of requests are being throttled or timing out over time?"*
 
 ```kusto
@@ -302,113 +298,4 @@ ApiManagementGatewayLogs
 
 ---
 
-### 5. Throttling and Error Rates by Endpoint and Deployment
-**What it does:** Extends the rate query by breaking it down per endpoint path and deployment name. Useful for multi-deployment or multi-API environments. Use this to answer: *"Which endpoint and deployment has the highest throttling rate?"*
 
-```kusto
-let lookback = 2h;
-let grain = 30s;
-let local_tz = "America/New_York";
-let llm =
-    ApiManagementGatewayLlmLog
-    | where TimeGenerated > ago(lookback)
-    | where isnotempty(CorrelationId)
-    | summarize DeploymentName = any(DeploymentName), ModelName = any(ModelName) by CorrelationId;
-ApiManagementGatewayLogs
-| where TimeGenerated > ago(lookback)
-| where Url has "/openai/v1/responses"
-| join kind=leftouter llm on CorrelationId
-| extend Deployment = coalesce(DeploymentName, "unknown")
-| extend Endpoint = tostring(parse_url(Url).Path)
-| extend BucketUtc = bin(TimeGenerated, grain)
-| summarize
-    TotalRequests = count(),
-    Success2xx = countif(ResponseCode between (200 .. 299)),
-    Throttled429 = countif(ResponseCode == 429),
-    OtherErrors = countif(ResponseCode >= 400 and ResponseCode != 429)
-  by BucketUtc, Endpoint, Deployment
-| extend
-    ThrottlingRatePct = round(100.0 * Throttled429 / TotalRequests, 2),
-    SuccessRatePct = round(100.0 * Success2xx / TotalRequests, 2),
-    ErrorRatePct = round(100.0 * OtherErrors / TotalRequests, 2)
-| extend LocalTime = coalesce(datetime_utc_to_local(BucketUtc, local_tz), BucketUtc)
-| project LocalTime, Endpoint, Deployment, TotalRequests, Success2xx, Throttled429, OtherErrors, ThrottlingRatePct, SuccessRatePct, ErrorRatePct
-| order by LocalTime desc, Endpoint asc, Deployment asc
-```
-
----
-
-### 6. Token Consumption Summary (Last 24 Hours)
-**What it does:** Aggregates token usage across all requests into a single summary row — total requests processed, total tokens consumed, and average tokens per request. Use this for billing estimation and capacity planning.
-
-```kusto
-ApiManagementGatewayLlmLog
-| where TimeGenerated > ago(24h)
-| summarize
-    PromptTokens = max(PromptTokens),
-    CompletionTokens = max(CompletionTokens),
-    TotalTokens = max(TotalTokens)
-  by RequestId
-| summarize
-    Requests = count(),
-    SumPromptTokens = sum(PromptTokens),
-    SumCompletionTokens = sum(CompletionTokens),
-    SumTotalTokens = sum(TotalTokens),
-    AvgPromptTokens = round(avg(PromptTokens), 2),
-    AvgCompletionTokens = round(avg(CompletionTokens), 2),
-    AvgTotalTokens = round(avg(TotalTokens), 2)
-```
-
----
-
-### 7. Streaming TTFT / TTLT from Application Insights
-**What it does:** Queries client-emitted custom metrics for streaming requests to surface Time To First Token (TTFT) and Time To Last Token (TTLT). These are measured at the client side during SSE stream consumption and pushed to Application Insights. Use this to answer: *"How responsive is the model for streaming users?"*
-
-```kusto
-// Query custom events emitted from Python client
-customEvents
-| where name == "streaming_request_completed"
-| where tostring(customDimensions.run_id) has "stream-sse"
-| project
-    TimeGenerated,
-    RequestIndex = tostring(customDimensions.request_index),
-    ClientRequestId = tostring(customDimensions.client_request_id),
-    StatusCode = tostring(customDimensions.status_code),
-    TTFT_ms = todouble(customMeasurements["ttft_ms"]),
-    TTLT_ms = todouble(customMeasurements["ttlt_ms"]),
-    Latency_s = todouble(customMeasurements["latency_s"])
-| order by TimeGenerated desc
-```
-
----
-
-## Key Concepts
-
-### Why `max()` Instead of `sum()` for Token Deduplication
-`ApiManagementGatewayLlmLog` can produce multiple rows per request (for example in streaming scenarios with sequence numbers). Using `max()` aggregated `by RequestId` ensures each request is counted once and prevents overcounting.
-
-### Why Throttled Requests Show `unknown` Deployment
-Throttled requests (429) are blocked by APIM's `rate-limit` policy **before** the request reaches the LLM backend. Since no backend call is made, no `ApiManagementGatewayLlmLog` row is created for those requests, so the deployment join returns null and falls back to `"unknown"`.
-
-### TTFT / TTLT Measurement
-The Responses API returns streaming responses in **SSE (Server-Sent Events)** format with `event:` and `data:` prefixed lines. True TTFT and TTLT can only be measured at the **HTTP client level** by timing chunk arrivals. APIM policy timing (`ClientTime`, `TotalTime`) provides an approximation:
-- `ClientTime` ≈ TTFT (time until response headers reached client)
-- `TotalTime` ≈ TTLT (total gateway-to-client time)
-
----
-
-## Environment Configuration
-
-```env
-TENANT_ID=<your-tenant-id>
-AZURE_OPENAI_SCOPE=https://ai.azure.com/.default
-SUB_ID=<your-subscription-id>
-PYGO_DEPLOYMENT=gpt-5.4-mini-pygo
-PROJECT_ENDPOINT=https://<your-foundry-project>.services.ai.azure.com/api/projects/proj-default
-```
-
----
-
-## Security Note
-
-The APIM subscription key used during testing should be **rotated** after any test session where it was exposed in code, screenshots, or chat sessions. Rotate via: **APIM portal → Subscriptions → Regenerate key**.
